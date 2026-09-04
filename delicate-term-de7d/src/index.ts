@@ -4,6 +4,7 @@ import type { JWTPayload } from 'jose';
 import type { Env } from './types';
 import { authMiddleware } from './auth';
 import { adminMiddleware } from './admin';
+import { paywallMiddleware } from './paywall';
 import { getFirestore } from './firestore';
 import { createCheckoutSession, stripeWebhook } from './stripe';
 
@@ -51,7 +52,7 @@ app.get('/issues', async (c) => {
   }
 });
 
-app.get('/issues/:slug/pdf', authMiddleware, async (c) => {
+app.get('/issues/:slug/pdf', authMiddleware, paywallMiddleware, async (c) => {
   const { slug } = c.req.param();
   try {
     const db = getFirestore(c.env);

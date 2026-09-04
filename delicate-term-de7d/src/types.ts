@@ -1,5 +1,7 @@
 export interface Env {
   PDFS: R2Bucket;
+  // Paywall access cache (positive results only) — see src/paywall.ts.
+  MEMBERSHIP_CACHE: KVNamespace;
   FIREBASE_PROJECT_ID: string;
   // Service-account credentials — also used to sign privileged Firestore writes.
   FIREBASE_CLIENT_EMAIL: string;

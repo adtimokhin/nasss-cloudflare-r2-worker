@@ -26,6 +26,13 @@
 			"binding": "nasss_api_files"
 		},
 	],
+	"kv_namespaces": [
+		{
+			// Paywall access cache — positive results only, 2h TTL. See src/paywall.ts.
+			"binding": "MEMBERSHIP_CACHE",
+			"id": "c75a693c18d1463f82b1302d591ea24a"
+		}
+	],
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
