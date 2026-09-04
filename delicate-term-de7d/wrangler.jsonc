@@ -5,10 +5,11 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "nasss-api",
+	"account_id": "b995942bab62db3d1d7e45ce37c9998c",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-06-15",
 	"observability": {
-		"enabled": true
+		"enabled": true,
 	},
 	"upload_source_maps": true,
 	"compatibility_flags": [
@@ -18,9 +19,13 @@
 		{
 			"binding": "PDFS",
 			// This bucket must exist before the worker can run — see README.md.
-			"bucket_name": "nasss-api-files"
-		}
-	]
+			"bucket_name": "nasss-api-files",
+		},
+		{
+			"bucket_name": "nasss-api-files",
+			"binding": "nasss_api_files"
+		},
+	],
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement

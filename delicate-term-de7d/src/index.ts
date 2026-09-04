@@ -13,9 +13,11 @@ const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 app.use('*', (c, next) => {
   const allowed = c.env.ALLOWED_ORIGIN;
   if (!allowed) return next();
-  const allowedOrigins = allowed.split(',').map((o) => o.trim());
+  const allowedOrigins = allowed.split(',').map((o) => o.trim()).filter(Boolean);
   return cors({
-    origin: (origin) => (allowedOrigins.includes(origin) ? origin : allowedOrigins[0]),
+    // Hono echoes back the request's Origin only if it's in this list;
+    // a non-listed origin gets no Access-Control-Allow-Origin header at all.
+    origin: allowedOrigins,
     allowMethods: ['GET', 'POST', 'PUT', 'OPTIONS'],
     allowHeaders: ['Authorization', 'Content-Type'],
   })(c, next);

@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>nasss-api upload test</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 24px; max-width: 900px; }
+  h1 { font-size: 18px; }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .05em; opacity: .7; margin: 28px 0 8px; }
+  fieldset { border: 1px solid #8884; border-radius: 8px; padding: 12px 16px; margin: 0; }
+  label { display: block; margin: 8px 0 2px; font-weight: 600; }
+  input, textarea { width: 100%; box-sizing: border-box; padding: 6px 8px; font: inherit; border: 1px solid #8886; border-radius: 6px; background: transparent; color: inherit; }
+  textarea { min-height: 120px; font-family: ui-monospace, monospace; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 180px; }
+  button { font: inherit; padding: 7px 14px; margin: 6px 6px 0 0; border: 1px solid #8886; border-radius: 6px; background: #8882; color: inherit; cursor: pointer; }
+  button:hover { background: #8884; }
+  #status { padding: 6px 10px; border-radius: 6px; background: #8882; display: inline-block; }
+  #log { white-space: pre-wrap; word-break: break-word; background: #8881; border: 1px solid #8884; border-radius: 8px; padding: 12px; min-height: 160px; font-family: ui-monospace, monospace; font-size: 12px; }
+  .note { background: #f9a82533; border: 1px solid #f9a82577; border-radius: 8px; padding: 10px 14px; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>nasss-api — upload a file + preview image</h1>
+
+<div class="note">
+  <strong>Before this works:</strong>
+  <ol style="margin:6px 0 0; padding-left:20px;">
+    <li>Serve this file over http, not <code>file://</code> — e.g. <code>npx serve</code> in the repo root, then open the printed <code>http://localhost:PORT/test.html</code>.</li>
+    <li>Add that origin to the Worker's <code>ALLOWED_ORIGIN</code> (comma-separated), or CORS will block the uploads. For local dev put e.g. <code>ALLOWED_ORIGIN=http://localhost:3000,https://www.serbianstudies.org</code> in <code>.dev.vars</code> and run <code>npm run dev</code>, then set Worker base URL below to <code>http://localhost:8787</code>.</li>
+    <li>Firestore security rules must allow the signed-in user to write <code>members/{uid}</code> and <code>issues/{slug}</code>. Quick test-mode rules:
+      <code>allow read, write: if request.auth != null;</code>
+      Otherwise create those two docs by hand in the console and skip the two "Firestore" buttons here.</li>
+  </ol>
+</div>
+
+<h2>1. Config</h2>
+<fieldset>
+  <label>Firebase web config (JSON — Project settings → Your apps → Web app → SDK setup)</label>
+  <textarea id="fbConfig" placeholder='{
+  "apiKey": "...",
+  "authDomain": "nasss-test.firebaseapp.com",
+  "projectId": "nasss-test",
+  "storageBucket": "nasss-test.appspot.com",
+  "messagingSenderId": "...",
+  "appId": "..."
+}'></textarea>
+  <label>Worker base URL</label>
+  <input id="workerBase" placeholder="https://nasss-api.<subdomain>.workers.dev" />
+  <div class="row">
+    <div><label>Email</label><input id="email" type="email" autocomplete="username" /></div>
+    <div><label>Password</label><input id="password" type="password" autocomplete="current-password" /></div>
+  </div>
+  <button id="btnInit">Init Firebase</button>
+  <button id="btnSignIn">Sign in</button>
+  <button id="btnSignOut">Sign out</button>
+  <p>Status: <span id="status">not initialized</span></p>
+</fieldset>
+
+<h2>2. Issue record (Firestore)</h2>
+<fieldset>
+  <div class="row">
+    <div><label>slug (used as the doc id)</label><input id="slug" value="issue-001" /></div>
+    <div><label>issue_number</label><input id="issueNumber" type="number" value="1" /></div>
+    <div><label>issue_date</label><input id="issueDate" value="2026-01-01" /></div>
+  </div>
+  <div class="row">
+    <div><label>title</label><input id="title" value="Test issue" /></div>
+    <div><label>pdf_object_key (R2 key the PDF is stored under)</label><input id="pdfObjectKey" value="issues/issue-001.pdf" /></div>
+  </div>
+  <button id="btnMakeAdmin">Set members/&lt;uid&gt; role = admin</button>
+  <button id="btnUpsertIssue">Upsert issues/&lt;slug&gt; doc</button>
+</fieldset>
+
+<h2>3. Upload through the Worker (→ R2 bucket)</h2>
+<fieldset>
+  <label>PDF file</label>
+  <input id="pdfFile" type="file" accept="application/pdf,.pdf" />
+  <label>Preview / cover image</label>
+  <input id="coverFile" type="file" accept="image/*" />
+  <button id="btnUploadPdf">POST /admin/issues/&lt;slug&gt;/pdf</button>
+  <button id="btnUploadCover">POST /admin/issues/&lt;slug&gt;/cover</button>
+</fieldset>
+
+<h2>4. Verify</h2>
+<fieldset>
+  <button id="btnGetIssues">GET /issues</button>
+  <button id="btnReadDoc">Read issues/&lt;slug&gt; from Firestore</button>
+  <button id="btnGetCover">GET /covers/&lt;slug&gt;.&lt;ext&gt; (opens in new tab)</button>
+</fieldset>
+
+<h2>Log</h2>
+<pre id="log"></pre>
+
+<script type="module">
+import { initializeApp, getApps, getApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import {
+  getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged,
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import {
+  getFirestore, doc, setDoc, getDoc,
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+const log = (msg, obj) => {
+  const line = typeof msg === "string" ? msg : JSON.stringify(msg);
+  logEl.textContent += line + (obj !== undefined ? "\n" + (typeof obj === "string" ? obj : JSON.stringify(obj, null, 2)) : "") + "\n\n";
+  logEl.scrollTop = logEl.scrollHeight;
+  console.log(msg, obj ?? "");
+};
+const setStatus = (t) => ($("status").textContent = t);
+
+// --- persist the form in localStorage so re-runs are painless ---
+const FIELDS = ["fbConfig", "workerBase", "email", "password", "slug", "issueNumber", "issueDate", "title", "pdfObjectKey"];
+const STORE = "nasss-api-test";
+try {
+  const saved = JSON.parse(localStorage.getItem(STORE) || "{}");
+  for (const f of FIELDS) if (saved[f] != null && $(f)) $(f).value = saved[f];
+} catch {}
+const save = () => {
+  const out = {};
+  for (const f of FIELDS) out[f] = $(f)?.value ?? "";
+  try { localStorage.setItem(STORE, JSON.stringify(out)); } catch {}
+};
+for (const f of FIELDS) $(f)?.addEventListener("input", save);
+
+const cfg = () => ({
+  workerBase: $("workerBase").value.trim().replace(/\/$/, ""),
+  slug: $("slug").value.trim(),
+});
+
+let app, auth, db;
+
+function ensureInit() {
+  if (auth) return true;
+  log("Not initialized — click 'Init Firebase' first.");
+  return false;
+}
+
+$("btnInit").onclick = () => {
+  try {
+    const conf = JSON.parse($("fbConfig").value);
+    app = getApps().length ? getApp() : initializeApp(conf);
+    auth = getAuth(app);
+    db = getFirestore(app);
+    onAuthStateChanged(auth, (u) => setStatus(u ? `signed in as ${u.email} (${u.uid})` : "initialized, signed out"));
+    setStatus("initialized, signed out");
+    log("Firebase initialized for project: " + conf.projectId);
+  } catch (e) {
+    log("Init failed", String(e));
+  }
+};
+
+$("btnSignIn").onclick = async () => {
+  if (!ensureInit()) return;
+  try {
+    const cred = await signInWithEmailAndPassword(auth, $("email").value.trim(), $("password").value);
+    log("Signed in", { uid: cred.user.uid, email: cred.user.email });
+  } catch (e) {
+    log("Sign-in failed", String(e));
+  }
+};
+
+$("btnSignOut").onclick = async () => {
+  if (!ensureInit()) return;
+  await signOut(auth);
+  log("Signed out");
+};
+
+$("btnMakeAdmin").onclick = async () => {
+  if (!ensureInit()) return;
+  const u = auth.currentUser;
+  if (!u) return log("Sign in first.");
+  try {
+    await setDoc(doc(db, "members", u.uid), { role: "admin" }, { merge: true });
+    log(`members/${u.uid} → { role: "admin" }`);
+  } catch (e) {
+    log("Firestore write failed (check security rules)", String(e));
+  }
+};
+
+$("btnUpsertIssue").onclick = async () => {
+  if (!ensureInit()) return;
+  const slug = $("slug").value.trim();
+  const data = {
+    slug,
+    issue_number: Number($("issueNumber").value),
+    issue_date: $("issueDate").value.trim(),
+    title: $("title").value.trim() || null,
+    pdf_object_key: $("pdfObjectKey").value.trim(),
+    published: true,
+    updated_at: new Date().toISOString(),
+  };
+  try {
+    // doc id == slug so the Worker's cover PATCH (issues/<id>) lines up
+    await setDoc(doc(db, "issues", slug), data, { merge: true });
+    log(`issues/${slug} upserted`, data);
+  } catch (e) {
+    log("Firestore write failed (check security rules)", String(e));
+  }
+};
+
+async function upload(kind) {
+  if (!ensureInit()) return;
+  const u = auth.currentUser;
+  if (!u) return log("Sign in first.");
+  const { workerBase, slug } = cfg();
+  if (!workerBase) return log("Set the Worker base URL.");
+  const file = (kind === "pdf" ? $("pdfFile") : $("coverFile")).files[0];
+  if (!file) return log(`No ${kind} file selected.`);
+  const token = await u.getIdToken();
+  const path = kind === "pdf" ? "pdf" : "cover";
+  const url = `${workerBase}/admin/issues/${encodeURIComponent(slug)}/${path}`;
+  const fd = new FormData();
+  fd.append("file", file);
+  log(`POST ${url}  (${file.name}, ${file.type || "?"}, ${file.size} bytes)`);
+  try {
+    const res = await fetch(url, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: fd });
+    const body = await res.text();
+    let parsed; try { parsed = JSON.parse(body); } catch { parsed = body; }
+    log(`→ ${res.status} ${res.statusText}`, parsed);
+  } catch (e) {
+    log("Request failed (CORS? wrong URL? Worker down?)", String(e));
+  }
+}
+$("btnUploadPdf").onclick = () => upload("pdf");
+$("btnUploadCover").onclick = () => upload("cover");
+
+$("btnGetIssues").onclick = async () => {
+  const { workerBase } = cfg();
+  if (!workerBase) return log("Set the Worker base URL.");
+  try {
+    const res = await fetch(`${workerBase}/issues`);
+    log(`GET ${workerBase}/issues → ${res.status}`, await res.json());
+  } catch (e) {
+    log("Request failed", String(e));
+  }
+};
+
+$("btnReadDoc").onclick = async () => {
+  if (!ensureInit()) return;
+  const slug = $("slug").value.trim();
+  try {
+    const snap = await getDoc(doc(db, "issues", slug));
+    log(`Firestore issues/${slug}`, snap.exists() ? snap.data() : "(document does not exist)");
+  } catch (e) {
+    log("Firestore read failed", String(e));
+  }
+};
+
+$("btnGetCover").onclick = () => {
+  const { workerBase, slug } = cfg();
+  const f = $("coverFile").files[0];
+  const ext = f ? (f.name.split(".").pop() || "jpg").toLowerCase() : "jpg";
+  window.open(`${workerBase}/covers/${slug}.${ext}`, "_blank");
+};
+</script>
+</body>
+</html>
