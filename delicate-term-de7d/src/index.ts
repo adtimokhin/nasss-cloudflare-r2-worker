@@ -5,6 +5,7 @@ import type { Env } from './types';
 import { authMiddleware } from './auth';
 import { adminMiddleware } from './admin';
 import { getFirestore } from './firestore';
+import { createCheckoutSession, stripeWebhook } from './stripe';
 
 type Variables = { user: JWTPayload };
 
@@ -210,5 +211,11 @@ app.get('/debug/list-bucket', authMiddleware, async (c) => {
     return c.json({ error: 'Internal server error' }, 500);
   }
 });
+
+// --- Stripe membership ---
+// POST /create-checkout-session — requires a Firebase ID token (authMiddleware).
+// POST /webhooks/stripe         — no auth; verified by the Stripe signature.
+app.post('/create-checkout-session', authMiddleware, createCheckoutSession);
+app.post('/webhooks/stripe', stripeWebhook);
 
 export default app;

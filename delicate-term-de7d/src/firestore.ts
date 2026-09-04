@@ -113,6 +113,42 @@ export class Firestore {
 		return rows[0] ?? null;
 	}
 
+	/**
+	 * Collection-group equality query — matches every collection named
+	 * `collectionId` anywhere in the database (used to find a member's
+	 * purchase/subscription by a Stripe id without knowing the uid).
+	 */
+	async queryGroup(collectionId: string, filters: Filter[], limit?: number): Promise<FirestoreDoc[]> {
+		const structuredQuery: Record<string, unknown> = {
+			from: [{ collectionId, allDescendants: true }],
+		};
+		if (filters.length) structuredQuery.where = buildWhere(filters);
+		if (limit) structuredQuery.limit = limit;
+
+		const res = await this.request(':runQuery', {
+			method: 'POST',
+			body: JSON.stringify({ structuredQuery }),
+		});
+		if (!res.ok) {
+			throw new Error(
+				`Firestore group query on ${collectionId} failed: ${res.status} ${await res.text()}`,
+			);
+		}
+		const rows = (await res.json()) as Array<{ document?: unknown }>;
+		return rows.filter((r) => r.document).map((r) => mapDocument(r.document));
+	}
+
+	/** GET every document in a collection path, e.g. `members/<uid>/purchases`. */
+	async listDocs(path: string): Promise<FirestoreDoc[]> {
+		const res = await this.request(`${path}?pageSize=300`);
+		if (res.status === 404) return [];
+		if (!res.ok) {
+			throw new Error(`Firestore list ${path} failed: ${res.status} ${await res.text()}`);
+		}
+		const json = (await res.json()) as { documents?: unknown[] };
+		return (json.documents ?? []).map((d) => mapDocument(d));
+	}
+
 	/** PATCH the given fields on a document, e.g. `issues/<id>`. */
 	async patchDoc(path: string, fields: Record<string, unknown>): Promise<void> {
 		const mask = Object.keys(fields)
@@ -175,6 +211,7 @@ function toFields(obj: Record<string, unknown>): Record<string, unknown> {
 
 function toValue(v: unknown): Record<string, unknown> {
 	if (v === null || v === undefined) return { nullValue: null };
+	if (v instanceof Date) return { timestampValue: v.toISOString() };
 	switch (typeof v) {
 		case 'boolean':
 			return { booleanValue: v };
