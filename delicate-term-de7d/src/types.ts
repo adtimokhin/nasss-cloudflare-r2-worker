@@ -9,6 +9,15 @@ export interface Env {
   ALLOWED_ORIGIN: string;
   STRIPE_SECRET_KEY: string;
   STRIPE_WEBHOOK_SECRET: string;
+  // PostHog server-side capture — see src/posthog.ts.
+  POSTHOG_API_KEY: string;
+  POSTHOG_HOST: string;
+  // Resend transactional email — see src/renewal.ts. Requires a verified
+  // sending domain in the Resend account.
+  RESEND_API_KEY: string;
+  // This Worker's own public base URL (custom domain or *.workers.dev), used
+  // to build the /renewal-redirect link sent in renewal-reminder emails.
+  WORKER_BASE_URL: string;
 }
 
 // -----------------------------------------------------------------------------
@@ -26,6 +35,16 @@ export interface Member {
   email: string;
   role: 'admin' | null;
   createdAt: string;
+  // Set by POST /deactivate-account, alongside disabling the Firebase Auth
+  // user. Lets the admin panel list active/deactivated members from a plain
+  // Firestore read instead of calling Identity Toolkit's lookup API.
+  account_disabled?: boolean;
+  deactivated_at?: string;
+  // Set by the renewal-reminder cron (src/renewal.ts) once an email goes out.
+  // `last_renewal_reminder_expiration` is the coverage_end/current_period_end
+  // the reminder was about, so a later run doesn't re-send for the same cycle.
+  last_renewal_reminder_sent?: string;
+  last_renewal_reminder_expiration?: string;
 }
 
 export interface MailingAddress {
@@ -37,13 +56,19 @@ export interface MailingAddress {
   country: string | null;
 }
 
-/** `members/{uid}/purchases/{stripe_checkout_session_id}` — one-time payments. */
+/**
+ * `members/{uid}/purchases/{purchaseId}` — one-time payments. Doc id is the
+ * Stripe checkout session id for a real purchase, or `gift_{uid}_{ts}` for
+ * one granted by an admin via POST /admin/gift-membership (which also sets
+ * `stripe_checkout_session_id`/`stripe_payment_intent_id` to null and
+ * `amount` to 0, and adds `gifted_by`).
+ */
 export interface Purchase {
   price_id: string | null;
   product_name: string;
   amount: number;
   currency: string;
-  stripe_checkout_session_id: string;
+  stripe_checkout_session_id: string | null;
   stripe_payment_intent_id: string | null;
   status: 'completed' | 'refunded';
   tier_granted: string;
@@ -52,6 +77,7 @@ export interface Purchase {
   requires_shipping: boolean;
   mailing_address: MailingAddress | null;
   purchased_at: string;
+  gifted_by?: string;
 }
 
 /** `members/{uid}/subscriptions/{stripe_subscription_id}` — recurring memberships. */
@@ -66,6 +92,11 @@ export interface Subscription {
   cancel_at_period_end: boolean;
   requires_shipping: boolean;
   mailing_address?: MailingAddress | null;
+  // Set by POST /deactivate-account. Billing is paused (Stripe
+  // pause_collection: void) but `status` is left as "active" — the
+  // subscription is not canceled, just not being charged.
+  paused?: boolean;
+  paused_at?: string;
   created_at: string;
   updated_at: string;
 }

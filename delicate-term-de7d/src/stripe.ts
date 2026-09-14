@@ -4,6 +4,7 @@ import type { JWTPayload } from 'jose';
 import type { Env } from './types';
 import { getFirestore, type Firestore, type FirestoreDoc } from './firestore';
 import { hasActiveMembership } from './membership';
+import { capturePosthogEvent } from './posthog';
 
 // -----------------------------------------------------------------------------
 // Stripe membership integration, per the NASSS Firestore schema.
@@ -26,8 +27,8 @@ import { hasActiveMembership } from './membership';
 type Ctx = Context<{ Bindings: Env; Variables: { user: JWTPayload } }>;
 
 const SUCCESS_URL =
-  'https://www.serbianstudies.org/membership-success?session_id={CHECKOUT_SESSION_ID}';
-const CANCEL_URL = 'https://www.serbianstudies.org/membership';
+  'https://www.serbianstudies.org/new-membership?checkout=success&session_id={CHECKOUT_SESSION_ID}';
+const CANCEL_URL = 'https://www.serbianstudies.org/new-membership?checkout=cancelled';
 
 // Countries offered in the Checkout shipping-address form (only used when the
 // product's `requires_shipping` is true). Trim/extend to taste.
@@ -61,7 +62,7 @@ export async function createCheckoutSession(c: Ctx): Promise<Response> {
   const uid = user.sub;
   if (!uid) return c.json({ error: 'Invalid token: missing user ID' }, 401);
 
-  let body: { price_id?: unknown };
+  let body: { price_id?: unknown; donation_amount?: unknown; ref?: unknown };
   try {
     body = await c.req.json();
   } catch {
@@ -73,12 +74,30 @@ export async function createCheckoutSession(c: Ctx): Promise<Response> {
     return c.json({ error: 'A valid price_id is required' }, 400);
   }
 
+  const donationAmountInput = body.donation_amount;
+  let donationAmount = 0;
+  if (donationAmountInput !== undefined) {
+    if (
+      typeof donationAmountInput !== 'number' ||
+      !Number.isInteger(donationAmountInput) ||
+      donationAmountInput < 0
+    ) {
+      return c.json({ error: 'donation_amount must be a non-negative integer' }, 400);
+    }
+    donationAmount = donationAmountInput;
+  }
+
+  const ref = typeof body.ref === 'string' ? body.ref : undefined;
+
   const db = getFirestore(c.env);
 
   // Both membership products (one-time and subscription) grant the same
   // access, so don't let an already-active member start a checkout for
   // either one — they'd just be paying to stack a second grant on top.
   if (await hasActiveMembership(db, uid)) {
+    c.executionCtx.waitUntil(
+      capturePosthogEvent(c.env, 'checkout_blocked_existing_membership', uid, {}),
+    );
     return c.json({ error: 'You already have an active membership.' }, 409);
   }
 
@@ -94,12 +113,30 @@ export async function createCheckoutSession(c: Ctx): Promise<Response> {
 
   try {
     const stripe = stripeClient(c.env);
+    const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = [
+      { price: priceId, quantity: 1 },
+    ];
+    if (donationAmount > 0) {
+      lineItems.push({
+        price_data: {
+          currency: 'usd',
+          product_data: { name: 'Donation' },
+          unit_amount: donationAmount,
+        },
+        quantity: 1,
+      });
+    }
+
     const params: Stripe.Checkout.SessionCreateParams = {
       mode: product.mode,
-      line_items: [{ price: priceId, quantity: 1 }],
+      line_items: lineItems,
       customer_email: typeof user.email === 'string' ? user.email : undefined,
       client_reference_id: uid,
-      metadata: { firebase_uid: uid, price_id: priceId },
+      metadata: {
+        firebase_uid: uid,
+        price_id: priceId,
+        ...(ref === 'renewal' ? { ref: 'renewal' } : {}),
+      },
       billing_address_collection: 'required',
       tax_id_collection: { enabled: true },
       success_url: SUCCESS_URL,
@@ -110,6 +147,9 @@ export async function createCheckoutSession(c: Ctx): Promise<Response> {
     }
     if (product.mode === 'payment') {
       params.customer_creation = 'always';
+      // So a payment_intent.payment_failed event (a card decline) can
+      // resolve back to the member — see the webhook's Case B handling.
+      params.payment_intent_data = { metadata: { firebase_uid: uid, price_id: priceId } };
     } else {
       // So every later subscription.* event can resolve the member.
       params.subscription_data = { metadata: { firebase_uid: uid, price_id: priceId } };
@@ -119,8 +159,212 @@ export async function createCheckoutSession(c: Ctx): Promise<Response> {
     return c.json({ id: session.id, url: session.url });
   } catch (err) {
     console.error('Failed to create Checkout session:', err);
+    c.executionCtx.waitUntil(
+      capturePosthogEvent(c.env, 'payment_failed', uid, {
+        failure_reason: 'session_creation_failed',
+      }),
+    );
     return c.json({ error: 'Could not start checkout' }, 500);
   }
+}
+
+// =============================================================================
+// POST /cancel-subscription
+// =============================================================================
+export async function cancelSubscription(c: Ctx): Promise<Response> {
+  const user = c.get('user');
+  const uid = user.sub;
+  if (!uid) return c.json({ error: 'Invalid token: missing user ID' }, 401);
+
+  let body: { subscription_doc_id?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const subId = body.subscription_doc_id;
+  if (typeof subId !== 'string' || !subId) {
+    return c.json({ error: 'subscription_doc_id is required' }, 400);
+  }
+
+  // Scoped under the caller's own uid, so this doubles as the ownership check
+  // — a subscription doc id that isn't theirs simply won't be found.
+  const db = getFirestore(c.env);
+  const path = `members/${uid}/subscriptions/${subId}`;
+  const sub = await db.getDoc(path);
+  if (!sub) {
+    return c.json({ error: 'Subscription not found' }, 404);
+  }
+  if (sub.status !== 'active') {
+    return c.json({ error: `Subscription is already ${sub.status}` }, 409);
+  }
+
+  try {
+    const stripe = stripeClient(c.env);
+    await stripe.subscriptions.update(subId, { cancel_at_period_end: true });
+  } catch (err) {
+    console.error('Failed to cancel Stripe subscription:', subId, err);
+    return c.json({ error: 'Could not cancel subscription' }, 500);
+  }
+
+  // Stripe keeps `status: "active"` until the period actually lapses — the
+  // subscription doc reflects that too; customer.subscription.updated will
+  // also fire and re-sync this same doc from Stripe.
+  await db.patchDoc(path, {
+    cancel_at_period_end: true,
+    updated_at: new Date(),
+  });
+
+  return c.json({ success: true });
+}
+
+// =============================================================================
+// POST /deactivate-account
+// =============================================================================
+export async function deactivateAccount(c: Ctx): Promise<Response> {
+  const user = c.get('user');
+  const uid = user.sub;
+  if (!uid) return c.json({ error: 'Invalid token: missing user ID' }, 401);
+
+  const db = getFirestore(c.env);
+  const stripe = stripeClient(c.env);
+
+  // Pause billing on every active subscription and schedule it to actually
+  // end at the current period boundary, without changing `status` and
+  // without touching the purchases subcollection — the ledger stays intact,
+  // only login + future charges + renewal stop. members/{uid} itself is
+  // touched below, but only with the account_disabled / deactivated_at flags.
+  const subscriptions = await db.listDocs(`members/${uid}/subscriptions`);
+  const active = subscriptions.filter((s) => s.status === 'active');
+
+  const now = new Date();
+  let pauseFailed = false;
+  for (const sub of active) {
+    try {
+      await stripe.subscriptions.update(sub._id, {
+        // 'void' immediately voids any invoice generated while paused — no
+        // charge, and nothing left uncollected/draft to reconcile later.
+        // ('mark_uncollectible' still finalizes and flags an invoice;
+        // 'keep_as_draft' leaves drafts accumulating — neither is "walk away
+        // cleanly" the way 'void' is.)
+        pause_collection: { behavior: 'void' },
+        // Also stop it renewing — otherwise a paused-forever subscription
+        // just sits "active" indefinitely with no invoices ever produced.
+        cancel_at_period_end: true,
+      });
+      // Mirror both flags in Firestore so a later customer.subscription.updated
+      // re-sync (which reads cancel_at_period_end straight from Stripe) agrees
+      // with what we just wrote instead of clobbering it back to false.
+      await db.patchDoc(`members/${uid}/subscriptions/${sub._id}`, {
+        paused: true,
+        paused_at: now,
+        cancel_at_period_end: true,
+      });
+    } catch (err) {
+      pauseFailed = true;
+      console.error('Failed to pause subscription', sub._id, 'for', uid, err);
+    }
+  }
+  if (pauseFailed) {
+    // Don't lock the account out of billing control if a pause failed.
+    return c.json({ error: 'Could not deactivate account' }, 500);
+  }
+
+  try {
+    await db.disableAuthUser(uid);
+    // So the admin panel can list active/deactivated members from a plain
+    // Firestore read instead of calling Identity Toolkit's lookup API.
+    await db.patchDoc(`members/${uid}`, {
+      account_disabled: true,
+      deactivated_at: now,
+    });
+  } catch (err) {
+    console.error('Failed to disable Firebase Auth user:', uid, err);
+    return c.json({ error: 'Could not deactivate account' }, 500);
+  }
+
+  return c.json({ success: true });
+}
+
+// =============================================================================
+// POST /admin/gift-membership
+// =============================================================================
+export async function giftMembership(c: Ctx): Promise<Response> {
+  const admin = c.get('user');
+  const adminUid = admin.sub;
+  if (!adminUid) return c.json({ error: 'Invalid token: missing user ID' }, 401);
+
+  let body: {
+    target_uid?: unknown;
+    price_id?: unknown;
+    custom_expiration?: unknown;
+    mailing_address?: unknown;
+  };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const targetUid = body.target_uid;
+  if (typeof targetUid !== 'string' || !targetUid) {
+    return c.json({ error: 'target_uid is required' }, 400);
+  }
+  const priceId = body.price_id;
+  if (typeof priceId !== 'string' || !priceId.startsWith('price_')) {
+    return c.json({ error: 'A valid price_id is required' }, 400);
+  }
+  const expirationInput = body.custom_expiration;
+  const expiration =
+    typeof expirationInput === 'string' || typeof expirationInput === 'number'
+      ? new Date(expirationInput)
+      : new Date(NaN);
+  if (Number.isNaN(expiration.getTime())) {
+    return c.json({ error: 'custom_expiration must be a valid date' }, 400);
+  }
+
+  const db = getFirestore(c.env);
+
+  const member = await db.getDoc(`members/${targetUid}`);
+  if (!member) {
+    return c.json({ error: 'Member not found' }, 404);
+  }
+
+  const productDoc = await db.getDoc(`products/${priceId}`);
+  if (!productDoc) {
+    return c.json({ error: 'Unknown price_id' }, 400);
+  }
+  const product = readProduct(productDoc, priceId);
+
+  const mailingAddress =
+    product.requires_shipping && body.mailing_address && typeof body.mailing_address === 'object'
+      ? (body.mailing_address as Record<string, unknown>)
+      : null;
+
+  const now = new Date();
+  // Distinct id scheme from real purchases (doc id = checkout session id) —
+  // there is no session, so this can't collide with one.
+  const purchaseId = `gift_${targetUid}_${Date.now()}`;
+
+  await db.patchDoc(`members/${targetUid}/purchases/${purchaseId}`, {
+    price_id: priceId,
+    product_name: product.name,
+    amount: 0,
+    currency: 'usd',
+    stripe_checkout_session_id: null,
+    stripe_payment_intent_id: null,
+    status: 'completed',
+    tier_granted: product.tier_granted,
+    coverage_start: now,
+    coverage_end: expiration,
+    requires_shipping: product.requires_shipping,
+    mailing_address: mailingAddress,
+    purchased_at: now,
+    gifted_by: adminUid,
+  });
+
+  return c.json({ success: true, purchase_id: purchaseId });
 }
 
 // =============================================================================
@@ -147,16 +391,60 @@ export async function stripeWebhook(c: Ctx): Promise<Response> {
   }
 
   const db = getFirestore(c.env);
+  const waitUntil = (p: Promise<unknown>) => c.executionCtx.waitUntil(p);
 
   try {
     switch (event.type) {
       case 'checkout.session.completed':
-        await handleCheckoutCompleted(stripe, db, event.data.object);
+        await handleCheckoutCompleted(stripe, db, event.data.object, c.env, waitUntil, event.id);
         break;
 
       case 'invoice.paid': {
         const subId = invoiceSubscriptionId(event.data.object);
         if (subId) await upsertSubscription(stripe, db, subId, {});
+        break;
+      }
+
+      case 'checkout.session.async_payment_failed': {
+        const session = event.data.object;
+        const uid = session.client_reference_id || session.metadata?.firebase_uid;
+        if (uid) {
+          waitUntil(
+            capturePosthogEvent(
+              c.env,
+              'payment_failed',
+              uid,
+              {
+                failure_reason: 'async_payment_failed',
+                price_id: session.metadata?.price_id ?? null,
+              },
+              event.id,
+            ),
+          );
+        }
+        break;
+      }
+
+      case 'payment_intent.payment_failed': {
+        const pi = event.data.object;
+        const uid = pi.metadata?.firebase_uid;
+        if (uid) {
+          waitUntil(
+            capturePosthogEvent(
+              c.env,
+              'payment_failed',
+              uid,
+              {
+                failure_reason:
+                  pi.last_payment_error?.decline_code ??
+                  pi.last_payment_error?.code ??
+                  'card_declined',
+                price_id: pi.metadata?.price_id ?? null,
+              },
+              event.id,
+            ),
+          );
+        }
         break;
       }
 
@@ -220,6 +508,9 @@ async function handleCheckoutCompleted(
   stripe: Stripe,
   db: Firestore,
   session: Stripe.Checkout.Session,
+  env: Env,
+  waitUntil: (p: Promise<unknown>) => void,
+  stripeEventId: string,
 ): Promise<void> {
   const uid = session.client_reference_id || session.metadata?.firebase_uid;
   if (!uid) {
@@ -231,6 +522,12 @@ async function handleCheckoutCompleted(
     session.metadata?.price_id ?? (await firstLineItemPrice(stripe, session.id));
   const product = await loadProduct(db, priceId);
   const shipping = getShippingDetails(session);
+
+  // Read before the write below so a renewal's lapse can be measured against
+  // whatever membership record already existed (this checkout always creates
+  // a new purchase/subscription doc, so the prior one is never overwritten).
+  const ref = session.metadata?.ref;
+  const priorExpiration = ref === 'renewal' ? await latestExpiration(db, uid) : null;
 
   if (session.mode === 'payment') {
     const start = new Date();
@@ -260,6 +557,39 @@ async function handleCheckoutCompleted(
       priceIdHint: priceId,
       shipping,
     });
+  }
+
+  // Fired only after the Firestore write above succeeds — this must reflect
+  // confirmed state, not attempted state.
+  waitUntil(
+    capturePosthogEvent(
+      env,
+      'payment_succeeded',
+      uid,
+      {
+        price_id: priceId ?? null,
+        mode: session.mode,
+        amount: session.amount_total ?? 0,
+        ...(ref ? { ref } : {}),
+      },
+      stripeEventId,
+    ),
+  );
+
+  if (ref === 'renewal') {
+    waitUntil(
+      capturePosthogEvent(
+        env,
+        'renewal_completed',
+        uid,
+        {
+          ...(priorExpiration
+            ? { lapse_days: Math.floor((Date.now() - priorExpiration.getTime()) / 86_400_000) }
+            : {}),
+        },
+        stripeEventId,
+      ),
+    );
   }
 
   // Best-effort: mirror name + shipping onto the Stripe Customer for the
@@ -407,10 +737,33 @@ async function uidBySubscription(db: Firestore, subId: string): Promise<string |
 }
 
 // name: projects/<p>/databases/(default)/documents/members/<uid>/<sub>/<id>
-function uidFromName(name: string): string {
+export function uidFromName(name: string): string {
   const parts = name.split('/');
   const i = parts.indexOf('members');
   return i >= 0 ? (parts[i + 1] ?? '') : '';
+}
+
+// Latest coverage_end/current_period_end across everything this member already
+// had before this checkout, used to measure a renewal's lapse. Any status is
+// considered — a lapsed/expired record is exactly what we want to measure from.
+async function latestExpiration(db: Firestore, uid: string): Promise<Date | null> {
+  const [purchases, subscriptions] = await Promise.all([
+    db.listDocs(`members/${uid}/purchases`),
+    db.listDocs(`members/${uid}/subscriptions`),
+  ]);
+
+  let latest: number | null = null;
+  for (const p of purchases) {
+    if (typeof p.coverage_end !== 'string') continue;
+    const t = Date.parse(p.coverage_end);
+    if (!Number.isNaN(t) && (latest === null || t > latest)) latest = t;
+  }
+  for (const s of subscriptions) {
+    if (typeof s.current_period_end !== 'string') continue;
+    const t = Date.parse(s.current_period_end);
+    if (!Number.isNaN(t) && (latest === null || t > latest)) latest = t;
+  }
+  return latest === null ? null : new Date(latest);
 }
 
 // Stripe address (nullable fields) -> plain map for Firestore.

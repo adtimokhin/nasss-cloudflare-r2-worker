@@ -11,7 +11,16 @@ import type { Env } from './types';
 // -----------------------------------------------------------------------------
 
 const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
-const DATASTORE_SCOPE = 'https://www.googleapis.com/auth/datastore';
+const IDENTITY_TOOLKIT_BASE = 'https://identitytoolkit.googleapis.com/v1';
+
+// Firestore access plus Identity Toolkit (for disableAuthUser below) — one
+// token, both scopes. The service account needs matching IAM roles for both
+// (Cloud Datastore User + Firebase Authentication Admin) or the Identity
+// Toolkit call fails with a permission error despite a valid token.
+const SERVICE_ACCOUNT_SCOPES = [
+	'https://www.googleapis.com/auth/datastore',
+	'https://www.googleapis.com/auth/identitytoolkit',
+].join(' ');
 
 // Access tokens live ~1h. Workers have no persistent state, so this module-level
 // cache is best-effort — it survives while the isolate is warm and is re-minted
@@ -39,7 +48,7 @@ export class Firestore {
 		const key = await importPKCS8(pem, 'RS256');
 		const iat = Math.floor(now / 1000);
 
-		const assertion = await new SignJWT({ scope: DATASTORE_SCOPE })
+		const assertion = await new SignJWT({ scope: SERVICE_ACCOUNT_SCOPES })
 			.setProtectedHeader({ alg: 'RS256', typ: 'JWT' })
 			.setIssuer(this.env.FIREBASE_CLIENT_EMAIL)
 			.setSubject(this.env.FIREBASE_CLIENT_EMAIL)
@@ -160,6 +169,27 @@ export class Firestore {
 		});
 		if (!res.ok) {
 			throw new Error(`Firestore PATCH ${path} failed: ${res.status} ${await res.text()}`);
+		}
+	}
+
+	/**
+	 * Disable a Firebase Auth user via the Identity Toolkit REST API. Reuses
+	 * the same service-account token as Firestore (see SERVICE_ACCOUNT_SCOPES)
+	 * — requires the service account to also hold the Firebase Authentication
+	 * Admin IAM role, not just Firestore access.
+	 */
+	async disableAuthUser(uid: string): Promise<void> {
+		const token = await this.accessToken();
+		const res = await fetch(`${IDENTITY_TOOLKIT_BASE}/accounts:update`, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${token}`,
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({ localId: uid, disableUser: true }),
+		});
+		if (!res.ok) {
+			throw new Error(`Identity Toolkit disableUser failed: ${res.status} ${await res.text()}`);
 		}
 	}
 }

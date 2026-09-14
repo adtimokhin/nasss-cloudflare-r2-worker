@@ -50,7 +50,25 @@
 	 * Note: Use secrets to store sensitive data.
 	 * https://developers.cloudflare.com/workers/configuration/secrets/
 	 */
-	// "vars": {  "MY_VARIABLE": "production_value" }
+	"vars": {
+		// Non-secret: PostHog's capture endpoint only needs the public Project
+		// API Key (POSTHOG_API_KEY, set via `wrangler secret put`), not this
+		// host. Swap for a Cloudflare reverse-proxy domain if one is set up.
+		"POSTHOG_HOST": "https://us.i.posthog.com",
+		// This Worker's own public base URL — used to build the
+		// /renewal-redirect link in renewal-reminder emails (src/renewal.ts).
+		// Replace with the deployed *.workers.dev URL or custom route.
+		"WORKER_BASE_URL": "https://nasss-api.<your-subdomain>.workers.dev",
+	},
+	/**
+	 * Cron Triggers
+	 * https://developers.cloudflare.com/workers/configuration/cron-triggers/
+	 * Daily at 13:00 UTC — adjust to taste. Drives the renewal-reminder job
+	 * in src/renewal.ts (scheduled export).
+	 */
+	"triggers": {
+		"crons": ["0 13 * * *"],
+	},
 	/**
 	 * Static Assets
 	 * https://developers.cloudflare.com/workers/static-assets/binding/

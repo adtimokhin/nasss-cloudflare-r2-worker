@@ -6,7 +6,15 @@ import { authMiddleware } from './auth';
 import { adminMiddleware } from './admin';
 import { paywallMiddleware } from './paywall';
 import { getFirestore } from './firestore';
-import { createCheckoutSession, stripeWebhook } from './stripe';
+import {
+  createCheckoutSession,
+  stripeWebhook,
+  cancelSubscription,
+  deactivateAccount,
+  giftMembership,
+} from './stripe';
+import { capturePosthogEvent } from './posthog';
+import { scheduled } from './renewal';
 
 type Variables = { user: JWTPayload };
 
@@ -214,9 +222,30 @@ app.get('/debug/list-bucket', authMiddleware, async (c) => {
 });
 
 // --- Stripe membership ---
-// POST /create-checkout-session — requires a Firebase ID token (authMiddleware).
-// POST /webhooks/stripe         — no auth; verified by the Stripe signature.
+// POST /create-checkout-session   — requires a Firebase ID token (authMiddleware).
+// POST /cancel-subscription       — requires a Firebase ID token (authMiddleware).
+// POST /deactivate-account        — requires a Firebase ID token (authMiddleware).
+// POST /admin/gift-membership     — admin-only; grants a purchase without Stripe.
+// POST /webhooks/stripe           — no auth; verified by the Stripe signature.
 app.post('/create-checkout-session', authMiddleware, createCheckoutSession);
+app.post('/cancel-subscription', authMiddleware, cancelSubscription);
+app.post('/deactivate-account', authMiddleware, deactivateAccount);
+app.post('/admin/gift-membership', authMiddleware, adminMiddleware, giftMembership);
 app.post('/webhooks/stripe', stripeWebhook);
 
-export default app;
+// GET /renewal-redirect?uid=...
+// Public — the link inside renewal-reminder emails (src/renewal.ts) routes
+// through here so the click can be captured to PostHog before bouncing to
+// the membership page.
+app.get('/renewal-redirect', (c) => {
+  const uid = c.req.query('uid');
+  if (uid) {
+    c.executionCtx.waitUntil(capturePosthogEvent(c.env, 'renewal_email_clicked', uid, {}));
+  }
+  return c.redirect('https://www.serbianstudies.org/new-membership?ref=renewal', 302);
+});
+
+export default {
+  fetch: app.fetch,
+  scheduled,
+};
