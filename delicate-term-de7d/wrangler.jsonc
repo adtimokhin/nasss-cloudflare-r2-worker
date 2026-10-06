@@ -5,10 +5,11 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "nasss-api",
+	"account_id": "b995942bab62db3d1d7e45ce37c9998c",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-06-15",
 	"observability": {
-		"enabled": true
+		"enabled": true,
 	},
 	"upload_source_maps": true,
 	"compatibility_flags": [
@@ -18,9 +19,20 @@
 		{
 			"binding": "PDFS",
 			// This bucket must exist before the worker can run — see README.md.
-			"bucket_name": "nasss-api-files"
+			"bucket_name": "nasss-api-files",
+		},
+		{
+			"bucket_name": "nasss-api-files",
+			"binding": "nasss_api_files"
+		},
+	],
+	"kv_namespaces": [
+		{
+			// Paywall access cache — positive results only, 2h TTL. See src/paywall.ts.
+			"binding": "MEMBERSHIP_CACHE",
+			"id": "c75a693c18d1463f82b1302d591ea24a"
 		}
-	]
+	],
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
@@ -38,7 +50,25 @@
 	 * Note: Use secrets to store sensitive data.
 	 * https://developers.cloudflare.com/workers/configuration/secrets/
 	 */
-	// "vars": {  "MY_VARIABLE": "production_value" }
+	"vars": {
+		// Non-secret: PostHog's capture endpoint only needs the public Project
+		// API Key (POSTHOG_API_KEY, set via `wrangler secret put`), not this
+		// host. Swap for a Cloudflare reverse-proxy domain if one is set up.
+		"POSTHOG_HOST": "https://us.i.posthog.com",
+		// This Worker's own public base URL — used to build the
+		// /renewal-redirect link in renewal-reminder emails (src/renewal.ts).
+		// Replace with the deployed *.workers.dev URL or custom route.
+		"WORKER_BASE_URL": "https://nasss-api.nasss.workers.dev",
+	},
+	/**
+	 * Cron Triggers
+	 * https://developers.cloudflare.com/workers/configuration/cron-triggers/
+	 * Daily at 13:00 UTC — adjust to taste. Drives the renewal-reminder job
+	 * in src/renewal.ts (scheduled export).
+	 */
+	"triggers": {
+		"crons": ["0 13 * * *"],
+	},
 	/**
 	 * Static Assets
 	 * https://developers.cloudflare.com/workers/static-assets/binding/

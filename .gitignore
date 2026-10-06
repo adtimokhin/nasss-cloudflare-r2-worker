@@ -1,0 +1,5 @@
+# Cloudflare local state
+.wrangler/
+
+# OS
+.DS_Store

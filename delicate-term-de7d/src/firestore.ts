@@ -11,7 +11,16 @@ import type { Env } from './types';
 // -----------------------------------------------------------------------------
 
 const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
-const DATASTORE_SCOPE = 'https://www.googleapis.com/auth/datastore';
+const IDENTITY_TOOLKIT_BASE = 'https://identitytoolkit.googleapis.com/v1';
+
+// Firestore access plus Identity Toolkit (for disableAuthUser below) — one
+// token, both scopes. The service account needs matching IAM roles for both
+// (Cloud Datastore User + Firebase Authentication Admin) or the Identity
+// Toolkit call fails with a permission error despite a valid token.
+const SERVICE_ACCOUNT_SCOPES = [
+	'https://www.googleapis.com/auth/datastore',
+	'https://www.googleapis.com/auth/identitytoolkit',
+].join(' ');
 
 // Access tokens live ~1h. Workers have no persistent state, so this module-level
 // cache is best-effort — it survives while the isolate is warm and is re-minted
@@ -21,6 +30,16 @@ let cachedToken: { value: string; expiresAt: number } | null = null;
 // A filter is always an equality check: [fieldPath, value]. Equality-only
 // queries with no server-side ordering need no composite index in Firestore.
 export type Filter = [string, unknown];
+
+// Thrown by createAuthUser below. message is Identity Toolkit's raw error
+// code (e.g. 'EMAIL_EXISTS', 'INVALID_EMAIL') — callers match on it directly
+// rather than parsing a free-text message.
+export class AuthUserCreateError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'AuthUserCreateError';
+	}
+}
 
 export class Firestore {
 	constructor(private readonly env: Env) {}
@@ -39,7 +58,7 @@ export class Firestore {
 		const key = await importPKCS8(pem, 'RS256');
 		const iat = Math.floor(now / 1000);
 
-		const assertion = await new SignJWT({ scope: DATASTORE_SCOPE })
+		const assertion = await new SignJWT({ scope: SERVICE_ACCOUNT_SCOPES })
 			.setProtectedHeader({ alg: 'RS256', typ: 'JWT' })
 			.setIssuer(this.env.FIREBASE_CLIENT_EMAIL)
 			.setSubject(this.env.FIREBASE_CLIENT_EMAIL)
@@ -113,6 +132,42 @@ export class Firestore {
 		return rows[0] ?? null;
 	}
 
+	/**
+	 * Collection-group equality query — matches every collection named
+	 * `collectionId` anywhere in the database (used to find a member's
+	 * purchase/subscription by a Stripe id without knowing the uid).
+	 */
+	async queryGroup(collectionId: string, filters: Filter[], limit?: number): Promise<FirestoreDoc[]> {
+		const structuredQuery: Record<string, unknown> = {
+			from: [{ collectionId, allDescendants: true }],
+		};
+		if (filters.length) structuredQuery.where = buildWhere(filters);
+		if (limit) structuredQuery.limit = limit;
+
+		const res = await this.request(':runQuery', {
+			method: 'POST',
+			body: JSON.stringify({ structuredQuery }),
+		});
+		if (!res.ok) {
+			throw new Error(
+				`Firestore group query on ${collectionId} failed: ${res.status} ${await res.text()}`,
+			);
+		}
+		const rows = (await res.json()) as Array<{ document?: unknown }>;
+		return rows.filter((r) => r.document).map((r) => mapDocument(r.document));
+	}
+
+	/** GET every document in a collection path, e.g. `members/<uid>/purchases`. */
+	async listDocs(path: string): Promise<FirestoreDoc[]> {
+		const res = await this.request(`${path}?pageSize=300`);
+		if (res.status === 404) return [];
+		if (!res.ok) {
+			throw new Error(`Firestore list ${path} failed: ${res.status} ${await res.text()}`);
+		}
+		const json = (await res.json()) as { documents?: unknown[] };
+		return (json.documents ?? []).map((d) => mapDocument(d));
+	}
+
 	/** PATCH the given fields on a document, e.g. `issues/<id>`. */
 	async patchDoc(path: string, fields: Record<string, unknown>): Promise<void> {
 		const mask = Object.keys(fields)
@@ -124,6 +179,111 @@ export class Firestore {
 		});
 		if (!res.ok) {
 			throw new Error(`Firestore PATCH ${path} failed: ${res.status} ${await res.text()}`);
+		}
+	}
+
+	/**
+	 * Create a new Firebase Auth user via the Identity Toolkit REST API —
+	 * same bearer-token admin call as setAuthUserDisabled/deleteAuthUser
+	 * below, needing the same Firebase Authentication Admin IAM role. Used
+	 * by POST /admin/import-members (src/admin.ts) to bulk-create accounts.
+	 * No password is set: the member sets their own later via the normal
+	 * "forgot password" email flow, sent client-side after the import
+	 * finishes (admin-pannel.html's Data Migration tab) — this call only
+	 * creates the identity, it never emails anything itself.
+	 * Throws AuthUserCreateError('EMAIL_EXISTS') if the email is already
+	 * registered, so the caller can skip that row instead of failing it.
+	 */
+	async createAuthUser(email: string, displayName?: string | null): Promise<string> {
+		const token = await this.accessToken();
+		// accounts:signUp is the one method name Identity Toolkit uses for
+		// creating a user both ways — called with an API key it's the public
+		// self-serve signup the client SDK uses; called with this service
+		// account's OAuth bearer token (as here) it's the privileged admin
+		// create, which is what lets emailVerified/disabled be set directly.
+		const res = await fetch(`${IDENTITY_TOOLKIT_BASE}/accounts:signUp`, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${token}`,
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				email,
+				displayName: displayName || undefined,
+				emailVerified: false,
+				disabled: false,
+			}),
+		});
+		const rawBody = await res.text();
+		let json: { localId?: string; error?: { message?: string } };
+		try {
+			json = rawBody ? JSON.parse(rawBody) : {};
+		} catch {
+			// A non-JSON body (an HTML error page, most often from hitting a
+			// wrong path) would otherwise surface as a cryptic
+			// "Unexpected token '<'" — this gives the caller something
+			// actionable instead.
+			throw new AuthUserCreateError(
+				`Identity Toolkit accounts:signUp returned a non-JSON response (${res.status}): ${rawBody.slice(0, 200)}`,
+			);
+		}
+		if (!res.ok) {
+			throw new AuthUserCreateError(json.error?.message ?? `Identity Toolkit accounts:signUp failed: ${res.status}`);
+		}
+		if (!json.localId) {
+			throw new AuthUserCreateError('Identity Toolkit accounts:signUp returned no localId');
+		}
+		return json.localId;
+	}
+
+	/**
+	 * Disable a Firebase Auth user via the Identity Toolkit REST API. Reuses
+	 * the same service-account token as Firestore (see SERVICE_ACCOUNT_SCOPES)
+	 * — requires the service account to also hold the Firebase Authentication
+	 * Admin IAM role, not just Firestore access.
+	 */
+	async disableAuthUser(uid: string): Promise<void> {
+		await this.setAuthUserDisabled(uid, true);
+	}
+
+	/**
+	 * Enable or disable a Firebase Auth user via the Identity Toolkit REST API.
+	 * `disableAuthUser` above is a thin wrapper over this for the disable-only
+	 * case; admin-initiated blocking (see src/admin.ts) needs to reverse it too.
+	 */
+	async setAuthUserDisabled(uid: string, disabled: boolean): Promise<void> {
+		const token = await this.accessToken();
+		const res = await fetch(`${IDENTITY_TOOLKIT_BASE}/accounts:update`, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${token}`,
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({ localId: uid, disableUser: disabled }),
+		});
+		if (!res.ok) {
+			throw new Error(`Identity Toolkit accounts:update (disableUser=${disabled}) failed: ${res.status} ${await res.text()}`);
+		}
+	}
+
+	/**
+	 * Permanently delete a Firebase Auth user via the Identity Toolkit REST
+	 * API — distinct from setAuthUserDisabled(uid, true): a disabled account
+	 * can be re-enabled, a deleted one can never sign in under this uid again.
+	 * Used by POST /delete-account (src/stripe.ts).
+	 */
+	async deleteAuthUser(uid: string): Promise<void> {
+		const token = await this.accessToken();
+		const res = await fetch(`${IDENTITY_TOOLKIT_BASE}/accounts:delete`, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${token}`,
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({ localId: uid }),
+		});
+		if (!res.ok) {
+			throw new Error(`Identity Toolkit accounts:delete failed: ${res.status} ${await res.text()}`);
 		}
 	}
 }
@@ -175,6 +335,7 @@ function toFields(obj: Record<string, unknown>): Record<string, unknown> {
 
 function toValue(v: unknown): Record<string, unknown> {
 	if (v === null || v === undefined) return { nullValue: null };
+	if (v instanceof Date) return { timestampValue: v.toISOString() };
 	switch (typeof v) {
 		case 'boolean':
 			return { booleanValue: v };

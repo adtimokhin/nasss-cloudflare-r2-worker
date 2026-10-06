@@ -2,6 +2,7 @@ import { jwtVerify, createRemoteJWKSet } from 'jose';
 import type { JWTPayload } from 'jose';
 import type { MiddlewareHandler } from 'hono';
 import type { Env } from './types';
+import { getFirestore } from './firestore';
 
 type HonoEnv = { Bindings: Env; Variables: { user: JWTPayload } };
 
@@ -34,6 +35,21 @@ export const authMiddleware: MiddlewareHandler<HonoEnv> = async (c, next) => {
     const authTime = (payload as { auth_time?: number }).auth_time;
     if (typeof authTime === 'number' && authTime > Math.floor(Date.now() / 1000) + 60) {
       return c.json({ error: 'Invalid token: auth_time is in the future' }, 401);
+    }
+
+    // Enforce an admin-initiated block (POST /admin/block-member) immediately,
+    // even for an ID token that hasn't naturally expired yet — Firebase's own
+    // disableUser doesn't invalidate already-issued tokens, and this Worker
+    // verifies tokens locally rather than via Admin SDK's revocation check.
+    // Fails open on a lookup error so a Firestore hiccup doesn't take down
+    // every authenticated route over a rarely-touched flag.
+    try {
+      const member = await getFirestore(c.env).getDoc(`members/${payload.sub}`);
+      if (member?.blocked) {
+        return c.json({ error: 'This account has been blocked.' }, 403);
+      }
+    } catch (err) {
+      console.error('Block-status check failed, allowing request:', payload.sub, err);
     }
 
     c.set('user', payload);
