@@ -3,7 +3,7 @@ import type { Context } from 'hono';
 import type { JWTPayload } from 'jose';
 import type { Env } from './types';
 import { getFirestore, type Firestore, type FirestoreDoc } from './firestore';
-import { hasActiveMembership } from './membership';
+import { hasActiveMembership, hasIssueAccess, hasArticleAccess } from './membership';
 import { capturePosthogEvent } from './posthog';
 
 // -----------------------------------------------------------------------------
@@ -40,8 +40,10 @@ const SHIPPING_COUNTRIES = [
 ] as Stripe.Checkout.SessionCreateParams.ShippingAddressCollection['allowed_countries'];
 
 // Workers have no Node crypto / sockets — Stripe needs the fetch HTTP client,
-// and webhook verification needs the SubtleCrypto provider.
-function stripeClient(env: Env): Stripe {
+// and webhook verification needs the SubtleCrypto provider. Exported for
+// src/journalPricing.ts, which needs the same client for admin-driven
+// Product/Price management — no reason to construct a second one.
+export function stripeClient(env: Env): Stripe {
   return new Stripe(env.STRIPE_SECRET_KEY, { httpClient: Stripe.createFetchHttpClient() });
 }
 const webCrypto = Stripe.createSubtleCryptoProvider();
@@ -62,7 +64,12 @@ export async function createCheckoutSession(c: Ctx): Promise<Response> {
   const uid = user.sub;
   if (!uid) return c.json({ error: 'Invalid token: missing user ID' }, 401);
 
-  let body: { price_id?: unknown; donation_amount?: unknown; ref?: unknown };
+  let body: {
+    price_id?: unknown;
+    donation_amount?: unknown;
+    ref?: unknown;
+    wants_physical_journal?: unknown;
+  };
   try {
     body = await c.req.json();
   } catch {
@@ -73,6 +80,10 @@ export async function createCheckoutSession(c: Ctx): Promise<Response> {
   if (typeof priceId !== 'string' || !priceId.startsWith('price_')) {
     return c.json({ error: 'A valid price_id is required' }, 400);
   }
+
+  // Defaults to true (opted in) when omitted, matching the member-doc field
+  // it mirrors (src/types.ts Member.wants_physical_journal).
+  const wantsPhysicalJournal = body.wants_physical_journal !== false;
 
   const donationAmountInput = body.donation_amount;
   let donationAmount = 0;
@@ -135,6 +146,7 @@ export async function createCheckoutSession(c: Ctx): Promise<Response> {
       metadata: {
         firebase_uid: uid,
         price_id: priceId,
+        wants_physical_journal: String(wantsPhysicalJournal),
         ...(ref === 'renewal' ? { ref: 'renewal' } : {}),
       },
       billing_address_collection: 'required',
@@ -142,17 +154,29 @@ export async function createCheckoutSession(c: Ctx): Promise<Response> {
       success_url: SUCCESS_URL,
       cancel_url: CANCEL_URL,
     };
-    if (product.requires_shipping) {
+    // The product may offer a physical copy, but the member's own
+    // preference (checked at signup or anytime from account-details) decides
+    // whether Stripe actually collects a shipping address for this purchase.
+    const effectiveShipping = product.requires_shipping && wantsPhysicalJournal;
+    if (effectiveShipping) {
       params.shipping_address_collection = { allowed_countries: SHIPPING_COUNTRIES };
     }
     if (product.mode === 'payment') {
       params.customer_creation = 'always';
       // So a payment_intent.payment_failed event (a card decline) can
       // resolve back to the member — see the webhook's Case B handling.
-      params.payment_intent_data = { metadata: { firebase_uid: uid, price_id: priceId } };
+      params.payment_intent_data = {
+        metadata: { firebase_uid: uid, price_id: priceId, wants_physical_journal: String(wantsPhysicalJournal) },
+      };
     } else {
-      // So every later subscription.* event can resolve the member.
-      params.subscription_data = { metadata: { firebase_uid: uid, price_id: priceId } };
+      // So every later subscription.* event can resolve the member — and,
+      // since wants_physical_journal is read back off the live Stripe
+      // subscription in upsertSubscription (not just this creation call),
+      // this metadata is what lets renewal/status-change events keep
+      // computing the same effective shipping choice.
+      params.subscription_data = {
+        metadata: { firebase_uid: uid, price_id: priceId, wants_physical_journal: String(wantsPhysicalJournal) },
+      };
     }
 
     const session = await stripe.checkout.sessions.create(params);
@@ -163,6 +187,240 @@ export async function createCheckoutSession(c: Ctx): Promise<Response> {
       capturePosthogEvent(c.env, 'payment_failed', uid, {
         failure_reason: 'session_creation_failed',
       }),
+    );
+    return c.json({ error: 'Could not start checkout' }, 500);
+  }
+}
+
+// =============================================================================
+// POST /create-issue-checkout-session
+// Lets a member buy one specific published issue individually, using the
+// price the admin wizard already created on that issue's own doc (src/
+// journalPricing.ts) — no products/{price_id} lookup needed, unlike the
+// membership flow above, since the Issue doc already carries everything a
+// Checkout line item needs. Deliberately not gated by hasActiveMembership:
+// an existing member buying one issue à la carte anyway is their call, not
+// an error. handleCheckoutCompleted below records the result with
+// Purchase.issue_slug set, which is what hasIssueAccess (src/membership.ts)
+// checks to unlock GET /issues/:slug/pdf for just this one issue.
+// =============================================================================
+export async function createIssueCheckoutSession(c: Ctx): Promise<Response> {
+  const user = c.get('user');
+  const uid = user.sub;
+  if (!uid) return c.json({ error: 'Invalid token: missing user ID' }, 401);
+
+  let body: { issue_slug?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const issueSlug = body.issue_slug;
+  if (typeof issueSlug !== 'string' || !issueSlug) {
+    return c.json({ error: 'issue_slug is required' }, 400);
+  }
+
+  const db = getFirestore(c.env);
+  const issue = await db.queryFirst('issues', [
+    ['slug', issueSlug],
+    ['published', true],
+  ]);
+  if (!issue) {
+    return c.json({ error: 'Issue not found' }, 404);
+  }
+  if (!issue.price_id) {
+    return c.json({ error: 'This issue is not sold individually' }, 400);
+  }
+
+  if (await hasIssueAccess(db, uid, issueSlug)) {
+    return c.json({ error: 'You already have access to this issue.' }, 409);
+  }
+
+  try {
+    const stripe = stripeClient(c.env);
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [{ price: issue.price_id, quantity: 1 }],
+      customer_email: typeof user.email === 'string' ? user.email : undefined,
+      client_reference_id: uid,
+      customer_creation: 'always',
+      billing_address_collection: 'required',
+      tax_id_collection: { enabled: true },
+      metadata: { firebase_uid: uid, purchase_type: 'issue', issue_slug: issueSlug, price_id: issue.price_id },
+      // So a payment_intent.payment_failed event can resolve back to the
+      // member — mirrors createCheckoutSession above.
+      payment_intent_data: {
+        metadata: { firebase_uid: uid, purchase_type: 'issue', issue_slug: issueSlug },
+      },
+      success_url: `https://www.serbianstudies.org/journal-preview?slug=${encodeURIComponent(issueSlug)}&checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `https://www.serbianstudies.org/journal-preview?slug=${encodeURIComponent(issueSlug)}&checkout=cancelled`,
+    });
+    return c.json({ id: session.id, url: session.url });
+  } catch (err) {
+    console.error('Failed to create issue Checkout session:', err);
+    c.executionCtx.waitUntil(
+      capturePosthogEvent(c.env, 'payment_failed', uid, {
+        failure_reason: 'session_creation_failed',
+        issue_slug: issueSlug,
+      }),
+    );
+    return c.json({ error: 'Could not start checkout' }, 500);
+  }
+}
+
+// =============================================================================
+// POST /create-article-checkout-session
+// Same shape as POST /create-issue-checkout-session above, scoped to one
+// article's own price instead of the issue's. Not gated by hasActiveMembership
+// or hasIssueAccess — buying one article individually is independent of
+// membership status (a member can still buy an article à la carte, same as
+// an issue). Only blocked if hasArticleAccess already says yes (covers full-
+// issue ownership, a prior direct purchase, or a bundled grant).
+// =============================================================================
+export async function createArticleCheckoutSession(c: Ctx): Promise<Response> {
+  const user = c.get('user');
+  const uid = user.sub;
+  if (!uid) return c.json({ error: 'Invalid token: missing user ID' }, 401);
+
+  let body: { issue_slug?: unknown; article_slug?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const issueSlug = body.issue_slug;
+  const articleSlug = body.article_slug;
+  if (typeof issueSlug !== 'string' || !issueSlug) {
+    return c.json({ error: 'issue_slug is required' }, 400);
+  }
+  if (typeof articleSlug !== 'string' || !articleSlug) {
+    return c.json({ error: 'article_slug is required' }, 400);
+  }
+
+  const db = getFirestore(c.env);
+  const issue = await db.queryFirst('issues', [
+    ['slug', issueSlug],
+    ['published', true],
+  ]);
+  if (!issue) {
+    return c.json({ error: 'Issue not found' }, 404);
+  }
+
+  const articles = Array.isArray(issue.articles) ? issue.articles : [];
+  const article = articles.find((a: { slug?: unknown }) => a.slug === articleSlug);
+  if (!article) {
+    return c.json({ error: 'Article not found' }, 404);
+  }
+  if (!article.price_id) {
+    return c.json({ error: 'This article is not sold individually' }, 400);
+  }
+
+  if (await hasArticleAccess(db, uid, issueSlug, articleSlug)) {
+    return c.json({ error: 'You already have access to this article.' }, 409);
+  }
+
+  try {
+    const stripe = stripeClient(c.env);
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [{ price: article.price_id, quantity: 1 }],
+      customer_email: typeof user.email === 'string' ? user.email : undefined,
+      client_reference_id: uid,
+      customer_creation: 'always',
+      billing_address_collection: 'required',
+      tax_id_collection: { enabled: true },
+      metadata: {
+        firebase_uid: uid,
+        purchase_type: 'article',
+        issue_slug: issueSlug,
+        article_slug: articleSlug,
+        price_id: article.price_id,
+      },
+      // So a payment_intent.payment_failed event can resolve back to the
+      // member — mirrors createCheckoutSession above.
+      payment_intent_data: {
+        metadata: { firebase_uid: uid, purchase_type: 'article', issue_slug: issueSlug, article_slug: articleSlug },
+      },
+      success_url: `https://www.serbianstudies.org/article-preview?issue=${encodeURIComponent(issueSlug)}&article=${encodeURIComponent(articleSlug)}&checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `https://www.serbianstudies.org/article-preview?issue=${encodeURIComponent(issueSlug)}&article=${encodeURIComponent(articleSlug)}&checkout=cancelled`,
+    });
+    return c.json({ id: session.id, url: session.url });
+  } catch (err) {
+    console.error('Failed to create article Checkout session:', err);
+    c.executionCtx.waitUntil(
+      capturePosthogEvent(c.env, 'payment_failed', uid, {
+        failure_reason: 'session_creation_failed',
+        issue_slug: issueSlug,
+        article_slug: articleSlug,
+      }),
+    );
+    return c.json({ error: 'Could not start checkout' }, 500);
+  }
+}
+
+// =============================================================================
+// POST /create-donation-checkout-session
+// A standalone donation, independent of membership — any signed-in member
+// can donate without buying or already holding a membership (unlike
+// createCheckoutSession above, this never checks hasActiveMembership).
+// Used by both the compact donation box on new-membership.html and the
+// dedicated donate.html page; `return_path` lets each send the member back
+// to itself after Stripe redirects back, same pattern as every other
+// checkout flow in this file returning to the page that started it.
+// =============================================================================
+const DONATION_MIN_CENTS = 100; // $1.00 — a sane floor, well above Stripe's own minimum charge
+
+export async function createDonationCheckoutSession(c: Ctx): Promise<Response> {
+  const user = c.get('user');
+  const uid = user.sub;
+  if (!uid) return c.json({ error: 'Invalid token: missing user ID' }, 401);
+
+  let body: { amount?: unknown; return_path?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const amount = body.amount;
+  if (typeof amount !== 'number' || !Number.isInteger(amount) || amount < DONATION_MIN_CENTS) {
+    return c.json({ error: `amount must be an integer number of cents, at least ${DONATION_MIN_CENTS}` }, 400);
+  }
+
+  const returnPath =
+    typeof body.return_path === 'string' && body.return_path.startsWith('/') ? body.return_path : '/donate';
+
+  try {
+    const stripe = stripeClient(c.env);
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: { name: 'Donation to NASSS' },
+            unit_amount: amount,
+          },
+          quantity: 1,
+        },
+      ],
+      customer_email: typeof user.email === 'string' ? user.email : undefined,
+      client_reference_id: uid,
+      customer_creation: 'always',
+      metadata: { firebase_uid: uid, purchase_type: 'donation' },
+      payment_intent_data: {
+        metadata: { firebase_uid: uid, purchase_type: 'donation' },
+      },
+      success_url: `https://www.serbianstudies.org${returnPath}?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `https://www.serbianstudies.org${returnPath}?checkout=cancelled`,
+    });
+    return c.json({ id: session.id, url: session.url });
+  } catch (err) {
+    console.error('Failed to create donation Checkout session:', err);
+    c.executionCtx.waitUntil(
+      capturePosthogEvent(c.env, 'payment_failed', uid, { failure_reason: 'session_creation_failed', donation: true }),
     );
     return c.json({ error: 'Could not start checkout' }, 500);
   }
@@ -220,6 +478,45 @@ export async function cancelSubscription(c: Ctx): Promise<Response> {
 }
 
 // =============================================================================
+// Shared: immediately cancel every not-yet-canceled Stripe subscription for a
+// member. Used by deactivateAccount, deleteAccount (below), and blockMember
+// (src/admin.ts) — any path that ends the member's access should also stop
+// billing right away rather than leaving a subscription to run out or rely
+// on a later manual cancellation.
+//
+// Stripe's own `subscriptions.cancel` is immediate (unlike
+// `cancel_at_period_end: true`, which just stops renewal) — billing stops
+// now and the subscription's Stripe status becomes "canceled" right away.
+// The Firestore doc is patched optimistically to match; the
+// customer.subscription.deleted webhook will also fire and re-confirm it.
+// =============================================================================
+export async function cancelActiveSubscriptions(env: Env, uid: string): Promise<boolean> {
+  const db = getFirestore(env);
+  const stripe = stripeClient(env);
+
+  const subscriptions = await db.listDocs(`members/${uid}/subscriptions`);
+  const cancelable = subscriptions.filter((s) => s.status !== 'canceled');
+
+  const now = new Date();
+  let allSucceeded = true;
+  for (const sub of cancelable) {
+    try {
+      await stripe.subscriptions.cancel(sub._id);
+      await db.patchDoc(`members/${uid}/subscriptions/${sub._id}`, {
+        status: 'canceled',
+        cancel_at_period_end: false,
+        canceled_at: now,
+        updated_at: now,
+      });
+    } catch (err) {
+      allSucceeded = false;
+      console.error('Failed to cancel subscription', sub._id, 'for', uid, err);
+    }
+  }
+  return allSucceeded;
+}
+
+// =============================================================================
 // POST /deactivate-account
 // =============================================================================
 export async function deactivateAccount(c: Ctx): Promise<Response> {
@@ -228,46 +525,10 @@ export async function deactivateAccount(c: Ctx): Promise<Response> {
   if (!uid) return c.json({ error: 'Invalid token: missing user ID' }, 401);
 
   const db = getFirestore(c.env);
-  const stripe = stripeClient(c.env);
 
-  // Pause billing on every active subscription and schedule it to actually
-  // end at the current period boundary, without changing `status` and
-  // without touching the purchases subcollection — the ledger stays intact,
-  // only login + future charges + renewal stop. members/{uid} itself is
-  // touched below, but only with the account_disabled / deactivated_at flags.
-  const subscriptions = await db.listDocs(`members/${uid}/subscriptions`);
-  const active = subscriptions.filter((s) => s.status === 'active');
-
-  const now = new Date();
-  let pauseFailed = false;
-  for (const sub of active) {
-    try {
-      await stripe.subscriptions.update(sub._id, {
-        // 'void' immediately voids any invoice generated while paused — no
-        // charge, and nothing left uncollected/draft to reconcile later.
-        // ('mark_uncollectible' still finalizes and flags an invoice;
-        // 'keep_as_draft' leaves drafts accumulating — neither is "walk away
-        // cleanly" the way 'void' is.)
-        pause_collection: { behavior: 'void' },
-        // Also stop it renewing — otherwise a paused-forever subscription
-        // just sits "active" indefinitely with no invoices ever produced.
-        cancel_at_period_end: true,
-      });
-      // Mirror both flags in Firestore so a later customer.subscription.updated
-      // re-sync (which reads cancel_at_period_end straight from Stripe) agrees
-      // with what we just wrote instead of clobbering it back to false.
-      await db.patchDoc(`members/${uid}/subscriptions/${sub._id}`, {
-        paused: true,
-        paused_at: now,
-        cancel_at_period_end: true,
-      });
-    } catch (err) {
-      pauseFailed = true;
-      console.error('Failed to pause subscription', sub._id, 'for', uid, err);
-    }
-  }
-  if (pauseFailed) {
-    // Don't lock the account out of billing control if a pause failed.
+  const allSucceeded = await cancelActiveSubscriptions(c.env, uid);
+  if (!allSucceeded) {
+    // Don't lock the account out of billing control if cancellation failed.
     return c.json({ error: 'Could not deactivate account' }, 500);
   }
 
@@ -277,7 +538,7 @@ export async function deactivateAccount(c: Ctx): Promise<Response> {
     // Firestore read instead of calling Identity Toolkit's lookup API.
     await db.patchDoc(`members/${uid}`, {
       account_disabled: true,
-      deactivated_at: now,
+      deactivated_at: new Date(),
     });
   } catch (err) {
     console.error('Failed to disable Firebase Auth user:', uid, err);
@@ -288,63 +549,185 @@ export async function deactivateAccount(c: Ctx): Promise<Response> {
 }
 
 // =============================================================================
+// POST /delete-account
+// =============================================================================
+// Self-service, permanent: cancels billing immediately (same helper as
+// deactivateAccount/blockMember) and permanently deletes the Firebase Auth
+// user — not just disables it, so the identity can never sign in again.
+// Deliberately does NOT delete members/{uid} or its purchases/subscriptions
+// subcollections: that's the financial ledger the admin panel's payment
+// history reads from, and accounting/audit needs it to survive the account
+// itself being gone. The member doc is instead flagged account_deleted so
+// admin views (and authMiddleware, if ever queried for a deleted uid) can
+// tell the difference from a merely-disabled account.
+export async function deleteAccount(c: Ctx): Promise<Response> {
+  const user = c.get('user');
+  const uid = user.sub;
+  if (!uid) return c.json({ error: 'Invalid token: missing user ID' }, 401);
+
+  const db = getFirestore(c.env);
+
+  const allSucceeded = await cancelActiveSubscriptions(c.env, uid);
+  if (!allSucceeded) {
+    return c.json({ error: 'Could not delete account' }, 500);
+  }
+
+  try {
+    await db.deleteAuthUser(uid);
+    await db.patchDoc(`members/${uid}`, {
+      account_deleted: true,
+      deleted_at: new Date(),
+    });
+  } catch (err) {
+    console.error('Failed to delete Firebase Auth user:', uid, err);
+    return c.json({ error: 'Could not delete account' }, 500);
+  }
+
+  return c.json({ success: true });
+}
+
+// =============================================================================
 // POST /admin/gift-membership
 // =============================================================================
-export async function giftMembership(c: Ctx): Promise<Response> {
-  const admin = c.get('user');
-  const adminUid = admin.sub;
-  if (!adminUid) return c.json({ error: 'Invalid token: missing user ID' }, 401);
+// Thrown by applyGift on bad input — carries the HTTP status the original
+// single-gift endpoint used to return for that same condition, so
+// giftMembership below can reproduce it exactly while the bulk importer
+// (src/admin.ts importMembers) can instead catch it per-row and keep going.
+export class GiftError extends Error {
+  constructor(message: string, public status: number = 400) {
+    super(message);
+    this.name = 'GiftError';
+  }
+}
 
-  let body: {
-    target_uid?: unknown;
-    price_id?: unknown;
-    custom_expiration?: unknown;
-    mailing_address?: unknown;
-  };
-  try {
-    body = await c.req.json();
-  } catch {
-    return c.json({ error: 'Invalid JSON body' }, 400);
+export interface GiftInput {
+  grant_type?: unknown;
+  price_id?: unknown;
+  custom_expiration?: unknown;
+  wants_physical_journal?: unknown;
+  mailing_address?: unknown;
+  issue_slug?: unknown;
+  article_slug?: unknown;
+}
+
+/**
+ * Grants `gift` to `targetUid` with no Stripe checkout involved — the same
+ * no-payment Purchase-doc write giftMembership (the single-member HTTP
+ * endpoint) has always done, factored out so the bulk member importer
+ * (POST /admin/import-members, src/admin.ts) can apply the exact same
+ * gift shapes to freshly-created members without going through HTTP.
+ * Throws GiftError on invalid input or a not-found issue/article/price —
+ * callers decide whether that aborts the whole request or just this one gift.
+ */
+export async function applyGift(
+  db: Firestore,
+  targetUid: string,
+  gift: GiftInput,
+  adminUid: string,
+): Promise<{ purchase_id: string }> {
+  // Defaults to 'membership' so this stays backward-compatible with the
+  // original single-purpose shape (just price_id/custom_expiration).
+  const grantType = typeof gift.grant_type === 'string' ? gift.grant_type : 'membership';
+
+  if (grantType === 'issue' || grantType === 'article') {
+    const issueSlug = gift.issue_slug;
+    if (typeof issueSlug !== 'string' || !issueSlug) {
+      throw new GiftError('issue_slug is required');
+    }
+    const issue = await db.getDoc(`issues/${issueSlug}`);
+    if (!issue) {
+      throw new GiftError('Issue not found', 404);
+    }
+
+    let articleSlug: string | null = null;
+    let productName = `${issue.title ?? issueSlug} — Single Issue (Gifted)`;
+    if (grantType === 'article') {
+      const rawArticleSlug = gift.article_slug;
+      if (typeof rawArticleSlug !== 'string' || !rawArticleSlug) {
+        throw new GiftError('article_slug is required');
+      }
+      const articles = Array.isArray(issue.articles) ? issue.articles : [];
+      const article = articles.find((a: { slug?: unknown }) => a.slug === rawArticleSlug);
+      if (!article) {
+        throw new GiftError('Article not found', 404);
+      }
+      articleSlug = rawArticleSlug;
+      productName = `${article.title} — Single Article (Gifted)`;
+    }
+
+    const now = new Date();
+    // Distinct id scheme from real purchases (doc id = checkout session id) —
+    // there is no session, so this can't collide with one.
+    const purchaseId = `gift_${targetUid}_${Date.now()}`;
+
+    await db.patchDoc(`members/${targetUid}/purchases/${purchaseId}`, {
+      price_id: null,
+      product_name: productName,
+      amount: 0,
+      currency: 'usd',
+      stripe_checkout_session_id: null,
+      stripe_payment_intent_id: null,
+      status: 'completed',
+      tier_granted: 'single-issue',
+      issue_slug: issueSlug,
+      article_slug: articleSlug,
+      coverage_start: now,
+      coverage_end: permanentCoverageEnd(now),
+      requires_shipping: false,
+      mailing_address: null,
+      purchased_at: now,
+      gifted_by: adminUid,
+    });
+
+    // Gifting the whole issue bundles its currently-individually-priced
+    // articles too — same reasoning as the real-purchase path in
+    // handleIssuePurchaseCompleted below. Not run for grantType === 'article'
+    // (that's already scoped to exactly one article).
+    if (grantType === 'issue') {
+      await grantBundledArticles(db, targetUid, issueSlug, issue, purchaseId, now);
+    }
+
+    return { purchase_id: purchaseId };
   }
 
-  const targetUid = body.target_uid;
-  if (typeof targetUid !== 'string' || !targetUid) {
-    return c.json({ error: 'target_uid is required' }, 400);
+  if (grantType !== 'membership') {
+    throw new GiftError(`Unknown grant_type: ${grantType}`);
   }
-  const priceId = body.price_id;
+
+  const priceId = gift.price_id;
   if (typeof priceId !== 'string' || !priceId.startsWith('price_')) {
-    return c.json({ error: 'A valid price_id is required' }, 400);
+    throw new GiftError('A valid price_id is required');
   }
-  const expirationInput = body.custom_expiration;
+  const expirationInput = gift.custom_expiration;
   const expiration =
     typeof expirationInput === 'string' || typeof expirationInput === 'number'
       ? new Date(expirationInput)
       : new Date(NaN);
   if (Number.isNaN(expiration.getTime())) {
-    return c.json({ error: 'custom_expiration must be a valid date' }, 400);
-  }
-
-  const db = getFirestore(c.env);
-
-  const member = await db.getDoc(`members/${targetUid}`);
-  if (!member) {
-    return c.json({ error: 'Member not found' }, 404);
+    throw new GiftError('custom_expiration must be a valid date');
   }
 
   const productDoc = await db.getDoc(`products/${priceId}`);
   if (!productDoc) {
-    return c.json({ error: 'Unknown price_id' }, 400);
+    throw new GiftError('Unknown price_id');
   }
   const product = readProduct(productDoc, priceId);
 
+  // Mirrors the real checkout flow's effectiveShipping (handleCheckoutCompleted
+  // above): the product merely supporting a physical copy isn't enough on its
+  // own — the admin must have actually opted in for *this* gift via the
+  // "Ship the physical journal?" checkbox, same as a member opting in
+  // themselves at checkout. Without this, every gift of a shippable product
+  // was unconditionally marked requires_shipping:true regardless of whether
+  // an address was even given.
+  const wantsPhysicalJournal = gift.wants_physical_journal === true;
+  const effectiveShipping = product.requires_shipping && wantsPhysicalJournal;
   const mailingAddress =
-    product.requires_shipping && body.mailing_address && typeof body.mailing_address === 'object'
-      ? (body.mailing_address as Record<string, unknown>)
+    effectiveShipping && gift.mailing_address && typeof gift.mailing_address === 'object'
+      ? (gift.mailing_address as Record<string, unknown>)
       : null;
 
   const now = new Date();
-  // Distinct id scheme from real purchases (doc id = checkout session id) —
-  // there is no session, so this can't collide with one.
   const purchaseId = `gift_${targetUid}_${Date.now()}`;
 
   await db.patchDoc(`members/${targetUid}/purchases/${purchaseId}`, {
@@ -358,13 +741,48 @@ export async function giftMembership(c: Ctx): Promise<Response> {
     tier_granted: product.tier_granted,
     coverage_start: now,
     coverage_end: expiration,
-    requires_shipping: product.requires_shipping,
+    requires_shipping: effectiveShipping,
     mailing_address: mailingAddress,
     purchased_at: now,
     gifted_by: adminUid,
   });
 
-  return c.json({ success: true, purchase_id: purchaseId });
+  return { purchase_id: purchaseId };
+}
+
+export async function giftMembership(c: Ctx): Promise<Response> {
+  const admin = c.get('user');
+  const adminUid = admin.sub;
+  if (!adminUid) return c.json({ error: 'Invalid token: missing user ID' }, 401);
+
+  let body: { target_uid?: unknown } & GiftInput;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const targetUid = body.target_uid;
+  if (typeof targetUid !== 'string' || !targetUid) {
+    return c.json({ error: 'target_uid is required' }, 400);
+  }
+
+  const db = getFirestore(c.env);
+
+  const member = await db.getDoc(`members/${targetUid}`);
+  if (!member) {
+    return c.json({ error: 'Member not found' }, 404);
+  }
+
+  try {
+    const result = await applyGift(db, targetUid, body, adminUid);
+    return c.json({ success: true, purchase_id: result.purchase_id });
+  } catch (err) {
+    if (err instanceof GiftError) {
+      return c.json({ error: err.message }, err.status as any);
+    }
+    throw err;
+  }
 }
 
 // =============================================================================
@@ -518,6 +936,29 @@ async function handleCheckoutCompleted(
     return;
   }
 
+  // Individual-issue purchases (POST /create-issue-checkout-session) don't
+  // go through products/{price_id} at all — the Issue doc already has
+  // everything needed — so this branches off before any of the
+  // membership-product logic below, which would otherwise fall back to a
+  // generic 365-day "standard" grant with no issue_slug.
+  if (session.metadata?.purchase_type === 'issue') {
+    await handleIssuePurchaseCompleted(db, session, uid, env, waitUntil, stripeEventId);
+    return;
+  }
+  // Individual-article purchases (POST /create-article-checkout-session) —
+  // same reasoning as the issue branch above, just scoped to one article.
+  if (session.metadata?.purchase_type === 'article') {
+    await handleArticlePurchaseCompleted(db, session, uid, env, waitUntil, stripeEventId);
+    return;
+  }
+  // Standalone donations (POST /create-donation-checkout-session) — a
+  // donation grants no access to anything, so it never touches
+  // products/{price_id} either.
+  if (session.metadata?.purchase_type === 'donation') {
+    await handleDonationCompleted(db, session, uid, env, waitUntil, stripeEventId);
+    return;
+  }
+
   const priceId =
     session.metadata?.price_id ?? (await firstLineItemPrice(stripe, session.id));
   const product = await loadProduct(db, priceId);
@@ -529,10 +970,14 @@ async function handleCheckoutCompleted(
   const ref = session.metadata?.ref;
   const priorExpiration = ref === 'renewal' ? await latestExpiration(db, uid) : null;
 
+  const wantsPhysicalJournal = session.metadata?.wants_physical_journal !== 'false';
+  const effectiveShipping = product.requires_shipping && wantsPhysicalJournal;
+
   if (session.mode === 'payment') {
     const start = new Date();
     const days = product.coverage_days ?? 365;
     const end = new Date(start.getTime() + days * 86_400_000);
+    const mailingAddress = effectiveShipping && shipping?.address ? plainAddress(shipping.address) : null;
 
     await db.patchDoc(`members/${uid}/purchases/${session.id}`, {
       price_id: priceId ?? null,
@@ -546,9 +991,8 @@ async function handleCheckoutCompleted(
       tier_granted: product.tier_granted,
       coverage_start: start,
       coverage_end: end,
-      requires_shipping: product.requires_shipping,
-      mailing_address:
-        product.requires_shipping && shipping?.address ? plainAddress(shipping.address) : null,
+      requires_shipping: effectiveShipping,
+      mailing_address: mailingAddress,
       purchased_at: start,
     });
   } else if (session.mode === 'subscription' && typeof session.subscription === 'string') {
@@ -617,6 +1061,233 @@ async function handleCheckoutCompleted(
 }
 
 /**
+ * ~100 years out — a practical "permanent" marker reused by every
+ * individual-issue/article grant (real purchase or admin gift): there's no
+ * coverage_days concept for owning one outright, and this lets them reuse
+ * the existing coverage_end > now check (hasIssueAccess, src/membership.ts)
+ * rather than inventing a separate "permanent: true" field every access-check
+ * and admin view would need to special-case.
+ */
+function permanentCoverageEnd(start: Date): Date {
+  return new Date(start.getTime() + 100 * 365 * 86_400_000);
+}
+
+/**
+ * Auto-grants every currently-individually-priced article in `issue` to
+ * `uid` whenever they come to own the whole issue outright (a real purchase
+ * via POST /create-issue-checkout-session, or an admin gift with
+ * grant_type 'issue') — owning the full issue already includes its
+ * articles, so without this a member who only ever bought the issue would
+ * show as not owning an article that's separately for sale, which will
+ * matter the moment article-level content gating is built (see the
+ * article_slug comment on the Purchase type in types.ts). Each grant is its
+ * own Purchase doc, keyed off `parentPurchaseId` so it can never collide
+ * with a genuine standalone purchase/gift of the same article. Articles
+ * added to the issue, or priced, after this runs are not retroactively
+ * granted — this only runs at the moment the issue itself is purchased/gifted.
+ */
+async function grantBundledArticles(
+  db: Firestore,
+  uid: string,
+  issueSlug: string,
+  issue: FirestoreDoc | null,
+  parentPurchaseId: string,
+  start: Date,
+): Promise<void> {
+  const articles = Array.isArray(issue?.articles)
+    ? (issue!.articles as Array<Record<string, unknown>>)
+    : [];
+  const pricedArticles = articles.filter(
+    (article) => typeof article.price_id === 'string' && article.price_id,
+  );
+  if (pricedArticles.length === 0) return;
+
+  const end = permanentCoverageEnd(start);
+  await Promise.all(
+    pricedArticles.map((article) =>
+      db.patchDoc(`members/${uid}/purchases/${parentPurchaseId}_article_${article.slug}`, {
+        price_id: null,
+        product_name: `${article.title} — Single Article (Included with Issue Purchase)`,
+        amount: 0,
+        currency: 'usd',
+        stripe_checkout_session_id: null,
+        stripe_payment_intent_id: null,
+        status: 'completed',
+        tier_granted: 'single-issue',
+        issue_slug: issueSlug,
+        article_slug: article.slug,
+        coverage_start: start,
+        coverage_end: end,
+        requires_shipping: false,
+        mailing_address: null,
+        purchased_at: start,
+      }),
+    ),
+  );
+}
+
+/**
+ * Records an individual issue purchase from POST /create-issue-checkout-session.
+ * There's no coverage_days concept for owning one issue outright, so
+ * coverage_end is set ~100 years out — a practical "permanent" marker that
+ * reuses the existing coverage_end > now check (hasIssueAccess, src/membership.ts)
+ * rather than inventing a separate "permanent: true" field every access-check
+ * and admin view would need to special-case.
+ */
+async function handleIssuePurchaseCompleted(
+  db: Firestore,
+  session: Stripe.Checkout.Session,
+  uid: string,
+  env: Env,
+  waitUntil: (p: Promise<unknown>) => void,
+  stripeEventId: string,
+): Promise<void> {
+  const issueSlug = session.metadata?.issue_slug;
+  if (!issueSlug) {
+    console.warn('Issue checkout.session.completed without an issue_slug:', session.id);
+    return;
+  }
+
+  const issue = await db.getDoc(`issues/${issueSlug}`);
+  const start = new Date();
+  const end = permanentCoverageEnd(start);
+
+  await db.patchDoc(`members/${uid}/purchases/${session.id}`, {
+    price_id: session.metadata?.price_id ?? null,
+    product_name: issue?.title ? `${issue.title} — Single Issue Purchase` : 'Single Issue Purchase',
+    amount: session.amount_total ?? 0,
+    currency: session.currency ?? 'usd',
+    stripe_checkout_session_id: session.id,
+    stripe_payment_intent_id: typeof session.payment_intent === 'string' ? session.payment_intent : null,
+    status: 'completed',
+    tier_granted: 'single-issue',
+    issue_slug: issueSlug,
+    coverage_start: start,
+    coverage_end: end,
+    requires_shipping: false,
+    mailing_address: null,
+    purchased_at: start,
+  });
+
+  await grantBundledArticles(db, uid, issueSlug, issue, session.id, start);
+
+  waitUntil(
+    capturePosthogEvent(
+      env,
+      'payment_succeeded',
+      uid,
+      { mode: 'payment', amount: session.amount_total ?? 0, issue_slug: issueSlug },
+      stripeEventId,
+    ),
+  );
+}
+
+/**
+ * Records an individual article purchase from POST /create-article-checkout-session.
+ * Same ~100-year "permanent" coverage_end reasoning as handleIssuePurchaseCompleted
+ * above. Unlike that one, this never calls grantBundledArticles — buying a
+ * single article doesn't grant anything beyond itself.
+ */
+async function handleArticlePurchaseCompleted(
+  db: Firestore,
+  session: Stripe.Checkout.Session,
+  uid: string,
+  env: Env,
+  waitUntil: (p: Promise<unknown>) => void,
+  stripeEventId: string,
+): Promise<void> {
+  const issueSlug = session.metadata?.issue_slug;
+  const articleSlug = session.metadata?.article_slug;
+  if (!issueSlug || !articleSlug) {
+    console.warn('Article checkout.session.completed without issue_slug/article_slug:', session.id);
+    return;
+  }
+
+  const issue = await db.getDoc(`issues/${issueSlug}`);
+  const articles = Array.isArray(issue?.articles) ? (issue!.articles as Array<Record<string, unknown>>) : [];
+  const article = articles.find((a) => a.slug === articleSlug);
+  const start = new Date();
+  const end = permanentCoverageEnd(start);
+
+  await db.patchDoc(`members/${uid}/purchases/${session.id}`, {
+    price_id: session.metadata?.price_id ?? null,
+    product_name: article?.title ? `${article.title} — Single Article Purchase` : 'Single Article Purchase',
+    amount: session.amount_total ?? 0,
+    currency: session.currency ?? 'usd',
+    stripe_checkout_session_id: session.id,
+    stripe_payment_intent_id: typeof session.payment_intent === 'string' ? session.payment_intent : null,
+    status: 'completed',
+    tier_granted: 'single-issue',
+    issue_slug: issueSlug,
+    article_slug: articleSlug,
+    coverage_start: start,
+    coverage_end: end,
+    requires_shipping: false,
+    mailing_address: null,
+    purchased_at: start,
+  });
+
+  waitUntil(
+    capturePosthogEvent(
+      env,
+      'payment_succeeded',
+      uid,
+      { mode: 'payment', amount: session.amount_total ?? 0, issue_slug: issueSlug, article_slug: articleSlug },
+      stripeEventId,
+    ),
+  );
+}
+
+/**
+ * Records a standalone donation from POST /create-donation-checkout-session.
+ * Unlike every other purchase type, this grants no access to anything, so
+ * coverage_end is deliberately left null rather than set to any date (past
+ * or future) — hasActiveMembership/findActiveMembershipDoc (src/membership.ts)
+ * and every client-side copy of that same "is this an active membership"
+ * check (new-membership.html, account-details.html, the admin shipping CSV)
+ * all gate on coverage_end being a parseable future date, so a null one is
+ * excluded everywhere automatically, with no extra exclusion logic needed —
+ * the same category of bug the issue_slug exclusion above was written to fix
+ * doesn't get a chance to happen here in the first place.
+ */
+async function handleDonationCompleted(
+  db: Firestore,
+  session: Stripe.Checkout.Session,
+  uid: string,
+  env: Env,
+  waitUntil: (p: Promise<unknown>) => void,
+  stripeEventId: string,
+): Promise<void> {
+  const start = new Date();
+
+  await db.patchDoc(`members/${uid}/purchases/${session.id}`, {
+    price_id: null,
+    product_name: 'Donation',
+    amount: session.amount_total ?? 0,
+    currency: session.currency ?? 'usd',
+    stripe_checkout_session_id: session.id,
+    stripe_payment_intent_id: typeof session.payment_intent === 'string' ? session.payment_intent : null,
+    status: 'completed',
+    tier_granted: 'donation',
+    coverage_start: start,
+    coverage_end: null,
+    requires_shipping: false,
+    mailing_address: null,
+    purchased_at: start,
+  });
+
+  waitUntil(
+    capturePosthogEvent(
+      env,
+      'donation_completed',
+      uid,
+      { amount: session.amount_total ?? 0 },
+      stripeEventId,
+    ),
+  );
+}
+
+/**
  * Create or refresh members/{uid}/subscriptions/{subId} from the live Stripe
  * subscription. Returns the resolved uid (or null if it can't be determined).
  */
@@ -642,6 +1313,13 @@ async function upsertSubscription(
   const period = subscriptionPeriod(sub);
   const customerId = typeof sub.customer === 'string' ? sub.customer : sub.customer.id;
 
+  // Read off the live Stripe subscription's own metadata (set at creation in
+  // createCheckoutSession) rather than `opts`, so later events like
+  // customer.subscription.updated — which don't have the original checkout
+  // request — still compute the same effective shipping choice.
+  const wantsPhysicalJournal = sub.metadata?.wants_physical_journal !== 'false';
+  const effectiveShipping = product.requires_shipping && wantsPhysicalJournal;
+
   const fields: Record<string, unknown> = {
     stripe_subscription_id: sub.id,
     stripe_customer_id: customerId,
@@ -651,13 +1329,13 @@ async function upsertSubscription(
     current_period_start: period.start,
     current_period_end: period.end,
     cancel_at_period_end: sub.cancel_at_period_end ?? false,
-    requires_shipping: product.requires_shipping,
+    requires_shipping: effectiveShipping,
     created_at: new Date(sub.created * 1000),
     updated_at: new Date(),
   };
   // Only touch mailing_address when we actually have one in hand (checkout), so
   // renewals / status changes never blank it.
-  if (product.requires_shipping && opts.shipping?.address) {
+  if (effectiveShipping && opts.shipping?.address) {
     fields.mailing_address = plainAddress(opts.shipping.address);
   }
 

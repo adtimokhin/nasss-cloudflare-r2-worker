@@ -58,7 +58,7 @@
 		// This Worker's own public base URL — used to build the
 		// /renewal-redirect link in renewal-reminder emails (src/renewal.ts).
 		// Replace with the deployed *.workers.dev URL or custom route.
-		"WORKER_BASE_URL": "https://nasss-api.<your-subdomain>.workers.dev",
+		"WORKER_BASE_URL": "https://nasss-api.nasss.workers.dev",
 	},
 	/**
 	 * Cron Triggers
